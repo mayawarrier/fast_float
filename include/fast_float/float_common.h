@@ -84,9 +84,14 @@
 #define FASTFLOAT_SSE2 1
 #endif
 
-#ifdef FASTFLOAT_SSE2
-#define FASTFLOAT_HAS_SIMD 1
+#if defined(__SSSE3__) || \
+  (defined(FASTFLOAT_VISUAL_STUDIO) && defined(__AVX__)) // VS provides no way to detect SSSE3
+#define FASTFLOAT_SSSE3 1
 #endif
+
+//#if defined(FASTFLOAT_SSE2) || defined(FASTFLOAT_SSSE3) || defined(__AVX2__)
+//#define FASTFLOAT_HAS_SIMD 1
+//#endif
 
 #if defined(__GNUC__)
 // disable -Wcast-align=strict (GCC only)
@@ -136,13 +141,13 @@ fastfloat_really_inline constexpr bool cpp20_and_in_constexpr() {
 #endif
 }
 
-fastfloat_really_inline constexpr bool has_simd() {
-#if FASTFLOAT_HAS_SIMD
-  return true;
-#else
-  return false;
-#endif
-}
+//fastfloat_really_inline constexpr bool has_simd() {
+//#ifdef FASTFLOAT_HAS_SIMD
+//  return true;
+//#else
+//  return false;
+//#endif
+//}
 
 // Compares two ASCII strings in a case insensitive manner.
 template <typename UC>

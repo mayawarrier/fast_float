@@ -9,20 +9,35 @@
 
 #include "float_common.h"
 
+
 #ifdef FASTFLOAT_SSE2
 #include <emmintrin.h>
 #endif
 
+#ifdef FASTFLOAT_SSSE3
+#include <tmmintrin.h>
+#endif
+
+#if defined(__AVX__) || defined(__AVX2__)
+#include <immintrin.h>
+#endif
+
+#if defined(FASTFLOAT_SSSE3) || defined(FASTFLOAT_SSE2)
+#define FASTFLOAT_HAS_SIMD_OPT_C16 1
+#endif
 
 namespace fast_float {
 
 template <typename UC>
 fastfloat_really_inline constexpr bool has_simd_opts() {
-#ifdef FASTFLOAT_HAS_SIMD
-  return std::is_same<UC, char16_t>::value;
-#else
-  return false;
+  return std::disjunction<
+#ifdef FASTFLOAT_HAS_SIMD_OPT_C16
+    std::is_same<UC, char16_t>
 #endif
+#ifdef FASTFLOAT_SSSE3
+    ,std::is_same<UC, char32_t>
+#endif
+  >::value;
 }
 
 // Next function can be micro-optimized, but compilers are entirely
@@ -46,7 +61,7 @@ fastfloat_really_inline constexpr uint64_t byteswap(uint64_t val) {
 // Read 8 UC into a u64. Truncates UC if not char.
 template <typename UC>
 fastfloat_really_inline FASTFLOAT_CONSTEXPR20
-uint64_t read8_to_u64(const UC *chars) {
+uint64_t read8(const UC *chars) {
   if (cpp20_and_in_constexpr() || !std::is_same<UC, char>::value) {
     uint64_t val = 0;
     for(int i = 0; i < 8; ++i) {
@@ -64,36 +79,101 @@ uint64_t read8_to_u64(const UC *chars) {
   return val;
 }
 
-#ifdef FASTFLOAT_SSE2
+#ifdef FASTFLOAT_SSSE3
 
 fastfloat_really_inline
-uint64_t simd_read8_to_u64(const __m128i data) {
+uint64_t simd_read8_c16(const __m128i data) {
+FASTFLOAT_SIMD_DISABLE_WARNINGS
+#define ZIDX4 0x80, 0x80, 0x80, 0x80
+  // indices of bytes to select from data. 0x80 means write 0
+  static const uint8_t kctrl[] = { 0x00, 0x02, 0x04, 0x06, 0x08, 0xa, 0xc, 0xe, ZIDX4, ZIDX4 };
+  const __m128i ctrl = _mm_loadu_si128(reinterpret_cast<const __m128i*>(kctrl));
+#undef ZIDX4
+  // is it worth using cvtepi16_epi8 (AVX512) over this? (assuming ctrl is loaded only once)
+  uint64_t val;
+  _mm_storeu_si64(&val, _mm_shuffle_epi8(data, ctrl));
+  return val;
+FASTFLOAT_SIMD_RESTORE_WARNINGS
+}
+
+#elif defined(FASTFLOAT_SSE2)
+
+fastfloat_really_inline
+uint64_t simd_read8_c16(const __m128i data) {
 FASTFLOAT_SIMD_DISABLE_WARNINGS
   static const char16_t kmasks[] = { 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff };
   const __m128i masks = _mm_loadu_si128(reinterpret_cast<const __m128i*>(kmasks));
-
-  // todo: with AVX512BW + AVX512VL, can use cvtepi16_epi8 instead of masking + pack
+  // need to mask as packus saturates (i.e. char set to 0xff if char16_t is above 0xff)
   __m128i masked = _mm_and_si128(data, masks);
   __m128i packed = _mm_packus_epi16(masked, masked);
-
+  
   uint64_t val;
   _mm_storeu_si64(&val, packed);
   return val;
 FASTFLOAT_SIMD_RESTORE_WARNINGS
 }
+#endif
 
+#ifdef FASTFLOAT_SSSE3
+
+// due to lane-crossing, an AVX/AVX2 version of this is probably not worth it
 fastfloat_really_inline
-uint64_t simd_read8_to_u64(const char16_t* chars) {
+uint64_t simd_read8_c32(const __m128i d1, const __m128i d2) {
 FASTFLOAT_SIMD_DISABLE_WARNINGS
-  return simd_read8_to_u64(_mm_loadu_si128(reinterpret_cast<const __m128i*>(chars)));
+#define ZIDX4 0x80, 0x80, 0x80, 0x80
+  // indices of bytes to select from data. 0x80 means write 0
+  static const uint8_t kctrl[] = { 0x00, 0x04, 0x08, 0x0c, ZIDX4, ZIDX4, ZIDX4 };
+  const __m128i ctrl = _mm_loadu_si128(reinterpret_cast<const __m128i*>(kctrl));
+#undef ZIDX4
+  // is it worth using mm256_cvtepi32_epi8 (AVX512) over this? (assuming ctrl is loaded only once)
+  __m128i i1 = _mm_shuffle_epi8(d1, ctrl);
+  __m128i i2 = _mm_shuffle_epi8(d2, ctrl);
+
+  uint64_t val;
+  _mm_storeu_si64(&val, _mm_unpacklo_epi32(i1, i2));
+  return val;
 FASTFLOAT_SIMD_RESTORE_WARNINGS
 }
 
+fastfloat_really_inline
+uint64_t simd_read8(const char32_t* chars) {
+FASTFLOAT_SIMD_DISABLE_WARNINGS
+  return simd_read8_c32(
+    _mm_loadu_si128(reinterpret_cast<const __m128i*>(chars)),
+    _mm_loadu_si128(reinterpret_cast<const __m128i*>(chars + 4)));
+FASTFLOAT_SIMD_RESTORE_WARNINGS
+}
+#endif
+
+#if defined(__AVX__) || defined(__AVX2__)
+// useful if data is already in 256-bit register
+fastfloat_really_inline
+uint64_t simd_read8_c32(const __m256i data) {
+FASTFLOAT_SIMD_DISABLE_WARNINGS
+  const __m128i d1 = _mm256_castsi256_si128(data);
+#ifdef __AVX2__
+  const __m128i d2 = _mm256_extracti128_si256(data, 1);
+#else
+  const __m128i d2 = _mm256_extractf128_si256(data, 1);
+#endif
+  return simd_read8_c32(d1, d2);
+FASTFLOAT_SIMD_RESTORE_WARNINGS
+}
+#endif
+
+
+#ifdef FASTFLOAT_HAS_SIMD_OPT_C16
+fastfloat_really_inline
+uint64_t simd_read8(const char16_t* chars) {
+FASTFLOAT_SIMD_DISABLE_WARNINGS
+  return simd_read8_c16(_mm_loadu_si128(reinterpret_cast<const __m128i*>(chars)));
+FASTFLOAT_SIMD_RESTORE_WARNINGS
+}
 #endif
 
 // dummy for compile
 template <typename UC, FASTFLOAT_ENABLE_IF(!has_simd_opts<UC>())>
-uint64_t simd_read8_to_u64(UC const*) {
+uint64_t simd_read8(UC const*) {
   return 0;
 }
 
@@ -133,9 +213,9 @@ template <typename UC>
 fastfloat_really_inline FASTFLOAT_CONSTEXPR20
 uint32_t parse_eight_digits_unrolled(UC const * chars)  noexcept {
   if (cpp20_and_in_constexpr() || !has_simd_opts<UC>()) {
-    return parse_eight_digits_unrolled(read8_to_u64(chars)); // truncation okay
+    return parse_eight_digits_unrolled(read8(chars)); // truncation okay
   }
-  return parse_eight_digits_unrolled(simd_read8_to_u64(chars));
+  return parse_eight_digits_unrolled(simd_read8(chars));
 }
 
 
@@ -147,8 +227,8 @@ fastfloat_really_inline constexpr bool is_made_of_eight_digits_fast(uint64_t val
 
 fastfloat_really_inline FASTFLOAT_CONSTEXPR20
 bool parse_if_eight_digits_unrolled(const char* chars, uint64_t& i) noexcept {
-  if (is_made_of_eight_digits_fast(read8_to_u64(chars))) {
-    i = i * 100000000 + parse_eight_digits_unrolled(read8_to_u64(chars));
+  if (is_made_of_eight_digits_fast(read8(chars))) {
+    i = i * 100000000 + parse_eight_digits_unrolled(read8(chars));
     return true;
   }
   return false;
@@ -163,7 +243,7 @@ bool parse_if_eight_digits_unrolled(const char* chars, uint64_t& i) noexcept {
 //
 fastfloat_really_inline FASTFLOAT_CONSTEXPR20
 bool parse_if_eight_digits_unrolled(const char16_t* chars, uint64_t& i) noexcept {
-#ifdef FASTFLOAT_SSE2
+#ifdef FASTFLOAT_HAS_SIMD_OPT_C16
   if (cpp20_and_in_constexpr()) {
     return false;
   }    
@@ -176,23 +256,44 @@ FASTFLOAT_SIMD_DISABLE_WARNINGS
   const __m128i t1 = _mm_cmpgt_epi16(t0, _mm_set1_epi16(-119));
 
   if (_mm_movemask_epi8(t1) == 0) {
-    i = i * 100000000 + parse_eight_digits_unrolled(simd_read8_to_u64(data));
+    i = i * 100000000 + parse_eight_digits_unrolled(simd_read8_c16(data));
     return true;
   }
   else return false;
 FASTFLOAT_SIMD_RESTORE_WARNINGS
 
 #else // No SIMD available
-
   (void)chars; (void)i; // unused
   return false;
 #endif
 }
 
-// todo, no simd optimization yet
+
 fastfloat_really_inline FASTFLOAT_CONSTEXPR20
-bool parse_if_eight_digits_unrolled(const char32_t*, uint64_t&) noexcept {
+bool parse_if_eight_digits_unrolled(const char32_t* chars, uint64_t& i) noexcept {
+#if defined(__AVX2__)
+  if (cpp20_and_in_constexpr()) {
+    return false;
+  }
+FASTFLOAT_SIMD_DISABLE_WARNINGS
+  const __m256i data = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(chars));
+
+  // (x - '0') <= 9
+  // http://0x80.pl/articles/simd-parsing-int-sequences.html
+  const __m256i t0 = _mm256_sub_epi32(data, _mm256_set1_epi32(80));
+  const __m256i t1 = _mm256_cmpgt_epi32(t0, _mm256_set1_epi32(-119));
+
+  if (_mm256_movemask_epi8(t1) == 0) {
+    i = i * 100000000 + parse_eight_digits_unrolled(simd_read8_c32(data));
+    return true;
+  }
+  else return false;
+FASTFLOAT_SIMD_RESTORE_WARNINGS
+
+#else // No SIMD available
+  (void)chars; (void)i; // unused
   return false;
+#endif
 }
 
 template <typename UC>
